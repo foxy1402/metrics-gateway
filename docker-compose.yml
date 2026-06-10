@@ -1,0 +1,22 @@
+services:
+  metrics-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+        - linux/arm64
+    ports:
+      - "8080:8080"
+    environment:
+      SERVICE_HOST: 0.0.0.0
+      SERVICE_PORT: 8080
+      SERVICE_ENDPOINT: /api/v1/metrics
+      SERVICE_TOKEN: ${SERVICE_TOKEN}
+    healthcheck:
+      test: ["CMD", "/app/service-healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
