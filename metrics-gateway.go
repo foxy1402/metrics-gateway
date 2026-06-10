@@ -8,9 +8,7 @@
 //   SERVICE_HOST           listen address                     (default: 0.0.0.0)
 //   SERVICE_PORT / PORT    listen port                        (default: 8080)
 //   SERVICE_ENDPOINT       WebSocket endpoint path             (default: /api/v1/metrics)
-//   SERVICE_TOKEN          authentication token (UUID format) (required for standard mode)
-//   SERVICE_CREDENTIAL     authentication credential          (required for enhanced mode)
-//   SERVICE_MODE           routing mode: standard or enhanced (default: standard)
+//   SERVICE_TOKEN          authentication token (UUID format) (required)
 //   RESOLVER_PATH          DNS resolver endpoint path         (default: /dns-query, set "" to disable)
 //
 // Build: go build -o metrics-gateway metrics-gateway.go
@@ -21,7 +19,6 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha1"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
@@ -61,7 +58,6 @@ func main() {
 	serviceHost := envOr("SERVICE_HOST", "0.0.0.0")
 	servicePort := envOr("SERVICE_PORT", envOr("PORT", "8080"))
 	serviceEndpoint := envOr("SERVICE_ENDPOINT", "/api/v1/metrics")
-	serviceMode := envOr("SERVICE_MODE", "standard")
 	resolverPath := envOr("RESOLVER_PATH", "/dns-query")
 	listenAddr := serviceHost + ":" + servicePort
 
@@ -69,36 +65,25 @@ func main() {
 		log.Fatalf("[metrics] RESOLVER_PATH %q conflicts with SERVICE_ENDPOINT", resolverPath)
 	}
 
-	var authToken []byte
-	switch serviceMode {
-	case "standard":
-		token := os.Getenv("SERVICE_TOKEN")
-		if token == "" {
-			log.Fatal("[metrics] SERVICE_TOKEN is required for standard mode")
-		}
-		uuid, err := parseUUID(token)
-		if err != nil {
-			log.Fatalf("[metrics] invalid SERVICE_TOKEN: %v", err)
-		}
-		authToken = uuid
-	case "enhanced":
-		if os.Getenv("SERVICE_CREDENTIAL") == "" {
-			log.Fatal("[metrics] SERVICE_CREDENTIAL is required for enhanced mode")
-		}
-	default:
-		log.Fatalf("[metrics] unsupported SERVICE_MODE: %s", serviceMode)
+	token := os.Getenv("SERVICE_TOKEN")
+	if token == "" {
+		log.Fatal("[metrics] SERVICE_TOKEN is required")
+	}
+	authToken, err := parseUUID(token)
+	if err != nil {
+		log.Fatalf("[metrics] invalid SERVICE_TOKEN: %v", err)
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", indexHandler)
-	mux.HandleFunc(serviceEndpoint, makeHandler(serviceMode, authToken))
+	mux.HandleFunc(serviceEndpoint, makeHandler(authToken))
 	mux.HandleFunc("/health", healthHandler)
 	if resolverPath != "" {
 		mux.HandleFunc(resolverPath, makeDNSHandler())
 	}
 
 	log.Printf("[metrics] listening  : %s", listenAddr)
-	log.Printf("[metrics] endpoint   : %s  mode=%s", serviceEndpoint, serviceMode)
+	log.Printf("[metrics] endpoint   : %s", serviceEndpoint)
 	if resolverPath != "" {
 		log.Printf("[metrics] DNS resolver: https://<your-public-domain>%s", resolverPath)
 	}
@@ -264,7 +249,7 @@ type routeHeader struct {
 	addr    string
 }
 
-func parseRouteHeader(r io.Reader, expectedUUID []byte, mode string, credential string) (*routeHeader, error) {
+func parseRouteHeader(r io.Reader, expectedUUID []byte) (*routeHeader, error) {
 	// Read version byte
 	var ver [1]byte
 	if _, err := io.ReadFull(r, ver[:]); err != nil {
@@ -280,22 +265,11 @@ func parseRouteHeader(r io.Reader, expectedUUID []byte, mode string, credential 
 		return nil, fmt.Errorf("read token: %w", err)
 	}
 
-	// Validate credentials based on mode
-	switch mode {
-	case "standard":
-		if expectedUUID == nil {
-			return nil, fmt.Errorf("token not configured")
-		}
-		if subtle.ConstantTimeCompare(token[:], expectedUUID) != 1 {
-			return nil, fmt.Errorf("authentication failed")
-		}
-	case "enhanced":
-		// Enhanced mode: SHA-224 of credential must match token field.
-		// This avoids sending the raw credential on the wire.
-		h := sha224Sum([]byte(credential))
-		if subtle.ConstantTimeCompare(token[:], h[:16]) != 1 {
-			return nil, fmt.Errorf("authentication failed")
-		}
+	if expectedUUID == nil {
+		return nil, fmt.Errorf("token not configured")
+	}
+	if subtle.ConstantTimeCompare(token[:], expectedUUID) != 1 {
+		return nil, fmt.Errorf("authentication failed")
 	}
 
 	// Read addon length and skip addon data
@@ -368,8 +342,7 @@ func parseRouteHeader(r io.Reader, expectedUUID []byte, mode string, credential 
 
 // ── Connection handler ───────────────────────────────────────────────────────
 
-func makeHandler(mode string, authToken []byte) http.HandlerFunc {
-	credential := os.Getenv("SERVICE_CREDENTIAL")
+func makeHandler(authToken []byte) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Validate GET method for WebSocket
 		if r.Method != http.MethodGet {
@@ -417,7 +390,7 @@ func makeHandler(mode string, authToken []byte) http.HandlerFunc {
 			return
 		}
 
-		hdr, err := parseRouteHeader(bytes.NewReader(payload), authToken, mode, credential)
+		hdr, err := parseRouteHeader(bytes.NewReader(payload), authToken)
 		if err != nil {
 			log.Printf("[metrics] header parse error remote=%s: %v", remote, err)
 			sendWSClose(wsConn)
@@ -801,13 +774,6 @@ func parseUUID(s string) ([]byte, error) {
 		return nil, fmt.Errorf("invalid hex: %w", err)
 	}
 	return b, nil
-}
-
-// sha224Sum returns the SHA-224 hash of data (Trojan-compatible auth: first 16 bytes used).
-func sha224Sum(data []byte) []byte {
-	h := sha256.New224()
-	h.Write(data)
-	return h.Sum(nil)
 }
 
 // isBlockedAddr checks whether a resolved address is in a blocked range

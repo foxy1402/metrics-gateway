@@ -6,23 +6,9 @@ log() { printf '[metrics] %s\n' "$*" >&2; }
 SERVICE_HOST="${SERVICE_HOST:-0.0.0.0}"
 SERVICE_PORT="${PORT:-${SERVICE_PORT:-8080}}"
 SERVICE_ENDPOINT="${SERVICE_ENDPOINT:-/api/v1/metrics}"
-SERVICE_MODE="${SERVICE_MODE:-standard}"
 
-case "$SERVICE_MODE" in
-    standard|enhanced) ;;
-    *)
-        log "SERVICE_MODE must be standard or enhanced (got: $SERVICE_MODE)"
-        exit 1
-        ;;
-esac
-
-if [ "$SERVICE_MODE" = "standard" ] && [ -z "${SERVICE_TOKEN:-}" ]; then
+if [ -z "${SERVICE_TOKEN:-}" ]; then
     log "SERVICE_TOKEN is required"
-    exit 1
-fi
-
-if [ "$SERVICE_MODE" = "enhanced" ] && [ -z "${SERVICE_CREDENTIAL:-}" ]; then
-    log "SERVICE_CREDENTIAL is required for enhanced mode"
     exit 1
 fi
 
