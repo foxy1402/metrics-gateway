@@ -1,0 +1,6 @@
+# Go build artifacts
+metrics-gateway
+*.exe
+
+# Logs
+*.log
