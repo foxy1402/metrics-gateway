@@ -6,8 +6,6 @@ services:
       platforms:
         - linux/amd64
         - linux/arm64
-    # When CLOUDFLARE_TUNNEL_TOKEN is set the tunnel handles all ingress.
-    # Remove or comment out 'ports' in that case to avoid direct exposure.
     ports:
       - "8080:8080"
     environment:
@@ -22,33 +20,3 @@ services:
       start_period: 10s
       retries: 3
     restart: unless-stopped
-    networks:
-      - gateway
-
-  # Cloudflare Tunnel sidecar — disabled by default.
-  # Set CLOUDFLARE_TUNNEL_TOKEN to enable. Configure the tunnel ingress in the
-  # Cloudflare dashboard to point to http://metrics-gateway:8080.
-  # When active, public traffic reaches the gateway via the tunnel so the
-  # 'ports' binding above can safely be removed.
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    restart: on-failure
-    entrypoint: ["sh", "-c"]
-    command:
-      - |
-        if [ -z "$$CLOUDFLARE_TUNNEL_TOKEN" ]; then
-          echo "[tunnel] CLOUDFLARE_TUNNEL_TOKEN not set — Cloudflare Tunnel disabled"
-          exit 0
-        fi
-        exec cloudflared tunnel --no-autoupdate run --token "$$CLOUDFLARE_TUNNEL_TOKEN"
-    environment:
-      CLOUDFLARE_TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
-    depends_on:
-      metrics-gateway:
-        condition: service_healthy
-    networks:
-      - gateway
-
-networks:
-  gateway:
-    driver: bridge

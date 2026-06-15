@@ -5,16 +5,11 @@
 // collectors based on routing metadata embedded in the payload.
 //
 // Environment variables:
-//   SERVICE_HOST              listen address                     (default: 0.0.0.0)
-//   SERVICE_PORT / PORT       listen port                        (default: 8080)
-//   SERVICE_ENDPOINT          WebSocket endpoint path             (default: /api/v1/metrics)
-//   SERVICE_TOKEN             authentication token (UUID format) (required)
-//   RESOLVER_PATH             DNS resolver endpoint path         (default: /dns-query, set "" to disable)
-//
-// Cloudflare Tunnel sidecar (docker-compose only — not used by this binary):
-//   CLOUDFLARE_TUNNEL_TOKEN   tunnel token from the Cloudflare dashboard; when set
-//                             the cloudflared sidecar creates an outbound-only tunnel
-//                             so no public port binding is required (default: disabled)
+//   SERVICE_HOST           listen address                     (default: 0.0.0.0)
+//   SERVICE_PORT / PORT    listen port                        (default: 8080)
+//   SERVICE_ENDPOINT       WebSocket endpoint path             (default: /api/v1/metrics)
+//   SERVICE_TOKEN          authentication token (UUID format) (required)
+//   RESOLVER_PATH          DNS resolver endpoint path         (default: /dns-query, set "" to disable)
 //
 // Build: go build -o metrics-gateway metrics-gateway.go
 
@@ -519,7 +514,7 @@ func bridgeTCP(wsConn net.Conn, wsReader *bufio.Reader, targetConn net.Conn) {
 	done := make(chan struct{}, 2)
 	resetDeadline := func() {
 		deadline := time.Now().Add(idleTimeout)
-		wsConn.SetDeadline(deadline)     //nolint:errcheck
+		wsConn.SetDeadline(deadline)   //nolint:errcheck
 		targetConn.SetDeadline(deadline) //nolint:errcheck
 	}
 	resetDeadline()
@@ -584,7 +579,7 @@ func bridgeUDP(wsConn net.Conn, wsReader *bufio.Reader, targetConn *net.UDPConn)
 	done := make(chan struct{}, 2)
 	resetDeadline := func() {
 		deadline := time.Now().Add(idleTimeout)
-		wsConn.SetDeadline(deadline)     //nolint:errcheck
+		wsConn.SetDeadline(deadline)   //nolint:errcheck
 		targetConn.SetDeadline(deadline) //nolint:errcheck
 	}
 	resetDeadline()
