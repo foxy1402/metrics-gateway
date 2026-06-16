@@ -13,6 +13,8 @@ jobs:
           fetch-depth: 0
 
       - name: Deploy to Gigalixir
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         run: |
-          git remote add gigalixir https://${{ secrets.GIGALIXIR_EMAIL }}:${{ secrets.GIGALIXIR_API_KEY }}@git.gigalixir.com/metrics.git/
-          git push gigalixir main
+          git remote add gigalixir https://git.gigalixir.com/metrics.git/
+          git -c http.extraHeader="Authorization: Basic $(echo -n '${{ secrets.GIGALIXIR_EMAIL }}:${{ secrets.GIGALIXIR_API_KEY }}' | base64 -w 0)" push gigalixir main
