@@ -1,6 +1,7 @@
 name: Keep Alive
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: '0 12 1,15 * *'  # runs on the 1st and 15th of every month at noon UTC
 
