@@ -5,11 +5,12 @@
 // collectors based on routing metadata embedded in the payload.
 //
 // Environment variables:
-//   SERVICE_HOST           listen address                     (default: 0.0.0.0)
-//   SERVICE_PORT / PORT    listen port                        (default: 8080)
+//   SERVICE_HOST           listen address                      (default: 0.0.0.0)
+//   PORT / SERVICE_PORT    listen port, PORT takes precedence  (default: 8080)
 //   SERVICE_ENDPOINT       WebSocket endpoint path             (default: /api/v1/metrics)
-//   SERVICE_TOKEN          authentication token (UUID format) (required)
-//   RESOLVER_PATH          DNS resolver endpoint path         (default: /dns-query, set "" to disable)
+//   SERVICE_TOKEN          authentication token (UUID format)  (required)
+//   RESOLVER_PATH          DNS resolver endpoint path          (default: /dns-query, set "" to disable)
+//   LOG_VERBOSE            set to any value to log stream targets (default: off)
 //
 // Build: go build -o metrics-gateway metrics-gateway.go
 
@@ -50,13 +51,31 @@ const maxWSPayload = 16 << 20 // 16 MiB
 const (
 	maxConnections = 1024
 	idleTimeout    = 5 * time.Minute
-	dialTimeout    = 15 * time.Second
+	// authTimeout bounds how long an upgraded connection may sit before
+	// completing stream authentication. It exists separately from idleTimeout
+	// because connections count against maxConnections from the moment they
+	// upgrade, and unauthenticated clients have no legitimate reason to idle.
+	authTimeout = 30 * time.Second
+	dialTimeout = 15 * time.Second
 )
 
-// activeConns tracks the number of currently active WebSocket sessions.
 var (
+	// activeConns counts every hijacked WebSocket connection, including
+	// upgraded-but-not-yet-authenticated ones, so unauthenticated clients
+	// cannot exhaust file descriptors behind the connection cap.
 	activeConns atomic.Int64
 	startTime   = time.Now()
+
+	// trackedWS holds every hijacked WebSocket connection so the shutdown
+	// path can close them cleanly (http.Server does not track hijacked
+	// connections). wsGroup lets shutdown wait for bridge goroutines to exit.
+	trackedWS sync.Map // net.Conn -> struct{}
+	wsGroup   sync.WaitGroup
+
+	// verboseLogging enables per-stream target logging via LOG_VERBOSE.
+	// PaaS platforms retain stdout logs, so routine traffic metadata — which
+	// hosts and ports users contact — stays off by default.
+	verboseLogging = os.Getenv("LOG_VERBOSE") != ""
 )
 
 // ── Concurrent WebSocket writer ───────────────────────────────────────────────
@@ -98,12 +117,30 @@ func (w *wsWriter) pong(payload []byte) {
 
 func main() {
 	serviceHost := envOr("SERVICE_HOST", "0.0.0.0")
-	servicePort := envOr("SERVICE_PORT", envOr("PORT", "8080"))
+	// PaaS platforms assign the listen port through PORT at runtime; it must
+	// win over any baked-in SERVICE_PORT default.
+	servicePort := envOr("PORT", envOr("SERVICE_PORT", "8080"))
 	serviceEndpoint := envOr("SERVICE_ENDPOINT", "/api/v1/metrics")
 	resolverPath := envOr("RESOLVER_PATH", "/dns-query")
 	listenAddr := serviceHost + ":" + servicePort
 
-	if resolverPath != "" && resolverPath == serviceEndpoint {
+	// Reject path configs that would either not match or make ServeMux panic
+	// on duplicate registration.
+	for _, p := range []struct{ name, path string }{
+		{"SERVICE_ENDPOINT", serviceEndpoint},
+		{"RESOLVER_PATH", resolverPath},
+	} {
+		if p.path == "" {
+			continue
+		}
+		if !strings.HasPrefix(p.path, "/") {
+			log.Fatalf("[metrics] %s %q must start with /", p.name, p.path)
+		}
+		if p.path == "/" || p.path == "/health" {
+			log.Fatalf("[metrics] %s %q conflicts with a built-in route", p.name, p.path)
+		}
+	}
+	if resolverPath == serviceEndpoint {
 		log.Fatalf("[metrics] RESOLVER_PATH %q conflicts with SERVICE_ENDPOINT", resolverPath)
 	}
 
@@ -131,23 +168,39 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Addr:              listenAddr,
-		Handler:           commonHeaders(mux),
+		Addr:    listenAddr,
+		Handler: commonHeaders(mux),
+		// Timeouts mirror a stock nginx front end: client_header_timeout 60s
+		// (we stay a little tighter), keepalive_timeout 75s, and 8-16k header
+		// buffers instead of Go's 1 MiB default. ReadTimeout/WriteTimeout only
+		// affect requests before hijacking, so streaming sessions are exempt.
 		ReadHeaderTimeout: 30 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       75 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+		// Go's http server logs client-side garbage (TLS probes, malformed
+		// request lines) to the server error log; a real nginx deployment does
+		// not surface those in stdout. Silence it to keep the log drain clean.
+		ErrorLog: log.New(io.Discard, "", 0),
 	}
 
 	// Graceful shutdown on SIGTERM / SIGINT.
 	// Heroku, Render, Railway, Fly.io all send SIGTERM and expect the process
-	// to exit within ~30 s before they send SIGKILL. We give srv.Shutdown 25 s
-	// so the OS has a small buffer. Hijacked WebSocket connections are outside
-	// http.Server's tracking and will be hard-closed by SIGKILL; for a
-	// single-user service this is acceptable.
+	// to exit within ~30 s before they send SIGKILL. Order of operations:
+	//   1. closeTrackedWS — send a WebSocket close frame to every hijacked
+	//      session (they are outside http.Server's tracking) and close the
+	//      underlying connections, unblocking all bridge goroutines;
+	//   2. waitBridges — give sessions a short window to finish;
+	//   3. srv.Shutdown — drain any remaining plain-HTTP requests.
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-quit
 		log.Printf("[metrics] shutdown signal received, draining…")
-		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		closeTrackedWS()
+		waitBridges(10 * time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
 			log.Printf("[metrics] shutdown error: %v", err)
@@ -158,6 +211,33 @@ func main() {
 		log.Fatalf("[metrics] fatal: %v", err)
 	}
 	log.Printf("[metrics] stopped")
+}
+
+func trackWS(c net.Conn)   { trackedWS.Store(c, struct{}{}) }
+func untrackWS(c net.Conn) { trackedWS.Delete(c) }
+
+// closeTrackedWS sends a WebSocket close frame to every live session and then
+// closes the underlying connection, unblocking all bridge goroutines.
+func closeTrackedWS() {
+	trackedWS.Range(func(key, _ any) bool {
+		if c, ok := key.(net.Conn); ok {
+			sendWSClose(c)
+			c.Close()
+			trackedWS.Delete(key)
+		}
+		return true
+	})
+}
+
+// waitBridges blocks until every tracked session has exited or d elapses.
+func waitBridges(d time.Duration) {
+	done := make(chan struct{})
+	go func() { wsGroup.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(d):
+		log.Printf("[metrics] drain timeout reached, forcing exit")
+	}
 }
 
 // commonHeaders is a thin middleware that stamps every non-hijacked HTTP
@@ -174,6 +254,21 @@ func commonHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// nginxError writes an HTML error page shaped byte-for-byte like a stock nginx
+// error page (server_tokens off), so error responses stay consistent with the
+// "Server: nginx" header. Go's default http.Error plain-text bodies are a Go
+// fingerprint that trivially breaks the cover story.
+func nginxError(w http.ResponseWriter, code int) {
+	msg := http.StatusText(code)
+	w.Header().Set("Content-Type", "text/html")
+	w.WriteHeader(code)
+	fmt.Fprintf(w,
+		"<html>\r\n<head><title>%d %s</title></head>\r\n"+
+			"<body>\r\n<center><h1>%d %s</h1></center>\r\n"+
+			"<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n",
+		code, msg, code, msg) //nolint:errcheck
+}
+
 // ── Health endpoint ───────────────────────────────────────────────────────────
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -182,7 +277,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	// Signal to PaaS load balancers that this instance is saturated so they
 	// stop routing new connections here (relevant if running multiple dynos).
 	if activeConns.Load() >= maxConnections {
-		http.Error(w, "at capacity", http.StatusServiceUnavailable)
+		nginxError(w, http.StatusServiceUnavailable)
 		return
 	}
 	fmt.Fprintln(w, "ok")
@@ -219,7 +314,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
-		http.NotFound(w, r)
+		nginxError(w, http.StatusNotFound)
+		return
+	}
+	// nginx serving a static page rejects everything that isn't GET/HEAD.
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		nginxError(w, http.StatusMethodNotAllowed)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -246,7 +346,7 @@ func makeDNSHandler(authToken []byte) http.HandlerFunc {
 			provided = r.URL.Query().Get("token")
 		}
 		if subtle.ConstantTimeCompare([]byte(provided), []byte(authHex)) != 1 {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			nginxError(w, http.StatusUnauthorized)
 			return
 		}
 
@@ -258,26 +358,34 @@ func makeDNSHandler(authToken []byte) http.HandlerFunc {
 		case http.MethodGet:
 			param := r.URL.Query().Get("dns")
 			if param == "" {
-				http.Error(w, "missing dns parameter", http.StatusBadRequest)
+				nginxError(w, http.StatusBadRequest)
 				return
 			}
 			query, err = base64.RawURLEncoding.DecodeString(param)
-			if err != nil {
-				http.Error(w, "invalid dns parameter", http.StatusBadRequest)
+			if err != nil || len(query) == 0 {
+				nginxError(w, http.StatusBadRequest)
 				return
 			}
 		case http.MethodPost:
 			if !strings.Contains(r.Header.Get("Content-Type"), "application/dns-message") {
-				http.Error(w, "content-type must be application/dns-message", http.StatusUnsupportedMediaType)
+				nginxError(w, http.StatusUnsupportedMediaType)
 				return
 			}
 			query, err = io.ReadAll(io.LimitReader(r.Body, 2048))
 			if err != nil || len(query) == 0 {
-				http.Error(w, "failed to read body", http.StatusBadRequest)
+				nginxError(w, http.StatusBadRequest)
 				return
 			}
 		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			nginxError(w, http.StatusMethodNotAllowed)
+			return
+		}
+
+		// DNS names cap at ~300 bytes over the wire; 2048 is generous. Beyond
+		// that the exchange would corrupt anyway (DNS-over-TCP length prefixes
+		// are 16-bit), so reject instead of truncating.
+		if len(query) > 2048 {
+			nginxError(w, http.StatusBadRequest)
 			return
 		}
 
@@ -289,7 +397,7 @@ func makeDNSHandler(authToken []byte) http.HandlerFunc {
 			log.Printf("[metrics] resolver upstream %s error: %v", upstream, err)
 		}
 		if err != nil {
-			http.Error(w, "all resolver upstreams failed", http.StatusBadGateway)
+			nginxError(w, http.StatusBadGateway)
 			return
 		}
 
@@ -301,6 +409,9 @@ func makeDNSHandler(authToken []byte) http.HandlerFunc {
 }
 
 func dnsOverTCP(server string, query []byte) ([]byte, error) {
+	if len(query) == 0 || len(query) > 0xffff {
+		return nil, fmt.Errorf("query length %d out of range for DNS-over-TCP", len(query))
+	}
 	conn, err := net.DialTimeout("tcp", server, 5*time.Second)
 	if err != nil {
 		return nil, err
@@ -342,7 +453,8 @@ func dnsOverTCP(server string, query []byte) ([]byte, error) {
 //	               Domain: 1 byte length + N bytes
 //	               IPv6:   16 bytes
 //
-// After the header, raw payload data follows.
+// After the header, raw payload data follows. The caller derives the header
+// length from the reader's remaining bytes instead of re-parsing.
 
 type routeHeader struct {
 	command byte
@@ -447,7 +559,7 @@ func makeHandler(authToken []byte) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Validate GET method for WebSocket
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			nginxError(w, http.StatusMethodNotAllowed)
 			return
 		}
 		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
@@ -457,7 +569,7 @@ func makeHandler(authToken []byte) http.HandlerFunc {
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Cache-Control", "no-cache")
 			fmt.Fprintf(w,
-				`{"service":"metrics-gateway","version":"3.0.0","status":"operational","uptime_seconds":%d,"streams":{"active":%d,"total_ingested":0},"timestamp":"%s"}`,
+				`{"service":"metrics-gateway","version":"3.1.0","status":"operational","uptime_seconds":%d,"streams":{"active":%d,"total_ingested":0},"timestamp":"%s"}`,
 				int64(time.Since(startTime).Seconds()),
 				activeConns.Load(),
 				time.Now().UTC().Format(time.RFC3339),
@@ -465,15 +577,15 @@ func makeHandler(authToken []byte) http.HandlerFunc {
 			return
 		}
 
-		// Enforce connection limit
+		// Enforce connection limit. Because the counter includes upgraded-but-
+		// not-yet-authenticated connections, unauthenticated floods trip this.
 		if activeConns.Load() >= maxConnections {
 			log.Printf("[metrics] capacity limit reached (%d)", maxConnections)
-			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			nginxError(w, http.StatusServiceUnavailable)
 			return
 		}
 
 		remote := realIP(r)
-		log.Printf("[metrics] client connected src=%s", remote)
 
 		wsConn, wsReader, err := upgradeWS(w, r)
 		if err != nil {
@@ -482,17 +594,31 @@ func makeHandler(authToken []byte) http.HandlerFunc {
 		}
 		defer wsConn.Close()
 
-		// Set idle timeout on first frame read
-		wsConn.SetReadDeadline(time.Now().Add(idleTimeout)) //nolint:errcheck
+		// From here the connection is hijacked: count it, register it for the
+		// shutdown path, and track the handler for the drain wait.
+		activeConns.Add(1)
+		defer activeConns.Add(-1)
+		trackWS(wsConn)
+		defer untrackWS(wsConn)
+		wsGroup.Add(1)
+		defer wsGroup.Done()
 
-		// Read first frame to get stream parameters.
-		payload, opcode, err := readWSFrame(wsReader)
+		// Wrap the connection in a mutex-protected writer now, since ping
+		// replies may already race the caller's writes during stream setup.
+		ww := newWSWriter(wsConn)
+
+		// Bound how long a client may sit unauthenticated. After stream setup
+		// the bridge installs idleTimeout instead.
+		wsConn.SetReadDeadline(time.Now().Add(authTimeout)) //nolint:errcheck
+
+		// Read the first data frame to get stream parameters. Control frames
+		// (ping/pong) before it are answered and skipped.
+		payload, err := readFirstDataFrame(wsReader, wsConn, ww)
 		if err != nil {
-			log.Printf("[metrics] stream init error src=%s: %v", remote, err)
-			sendWSClose(wsConn)
-			return
-		}
-		if opcode == 0x8 { // close frame
+			if err != errClientClosed {
+				log.Printf("[metrics] stream init error src=%s: %v", remote, err)
+				sendWSClose(wsConn)
+			}
 			return
 		}
 		if len(payload) < 22 { // minimum header size
@@ -501,38 +627,40 @@ func makeHandler(authToken []byte) http.HandlerFunc {
 			return
 		}
 
-		hdr, err := parseRouteHeader(bytes.NewReader(payload), authToken)
+		br := bytes.NewReader(payload)
+		hdr, err := parseRouteHeader(br, authToken)
 		if err != nil {
 			log.Printf("[metrics] stream setup failed src=%s: %v", remote, err)
 			sendWSClose(wsConn)
 			return
 		}
+		// Bytes consumed by the header = total frame minus what the reader
+		// has left. Anything after it is stream data.
+		headerLen := len(payload) - br.Len()
 
 		// Resolve and validate destination (SSRF protection).
 		target, err := resolveAndCheckTarget(hdr.addr, fmt.Sprintf("%d", hdr.port))
 		if err != nil {
-			log.Printf("[metrics] upstream unavailable src=%s addr=%s: %v", remote, hdr.addr, err)
+			log.Printf("[metrics] target rejected src=%s: %v", remote, err)
+			if verboseLogging {
+				log.Printf("[metrics] rejected target addr=%s src=%s", hdr.addr, remote)
+			}
 			sendWSClose(wsConn)
 			return
 		}
-		log.Printf("[metrics] upstream=%s op=%d src=%s", target, hdr.command, remote)
-
-		// Track connection
-		activeConns.Add(1)
-		defer activeConns.Add(-1)
+		log.Printf("[metrics] stream authorized src=%s op=%d", remote, hdr.command)
+		if verboseLogging {
+			log.Printf("[metrics] upstream=%s op=%d src=%s", target, hdr.command, remote)
+		}
 
 		// Clear deadline before bridging (bridge sets its own)
 		wsConn.SetReadDeadline(time.Time{}) //nolint:errcheck
-
-		// Wrap the connection in a mutex-protected writer now that two goroutines
-		// will write concurrently (data forwarding + ping-pong replies).
-		ww := newWSWriter(wsConn)
 
 		switch hdr.command {
 		case 1: // TCP
 			targetConn, err := net.DialTimeout("tcp", target, dialTimeout)
 			if err != nil {
-				log.Printf("[metrics] upstream error src=%s upstream=%s: %v", remote, target, err)
+				log.Printf("[metrics] upstream dial error src=%s: %v", remote, err)
 				sendWSClose(wsConn)
 				return
 			}
@@ -551,7 +679,6 @@ func makeHandler(authToken []byte) http.HandlerFunc {
 			}
 
 			// Flush any payload bytes that followed the stream header.
-			headerLen := computeHeaderLen(payload)
 			if headerLen < len(payload) {
 				if _, err := targetConn.Write(payload[headerLen:]); err != nil {
 					log.Printf("[metrics] stream flush error src=%s: %v", remote, err)
@@ -559,20 +686,18 @@ func makeHandler(authToken []byte) http.HandlerFunc {
 				}
 			}
 
-			log.Printf("[metrics] stream open src=%s upstream=%s", remote, target)
 			bridgeTCP(ww, wsReader, targetConn)
-			log.Printf("[metrics] stream closed src=%s", remote)
 
 		case 2: // UDP
 			targetAddr, err := net.ResolveUDPAddr("udp", target)
 			if err != nil {
-				log.Printf("[metrics] datagram resolve error src=%s addr=%s: %v", remote, target, err)
+				log.Printf("[metrics] datagram resolve error src=%s: %v", remote, err)
 				sendWSClose(wsConn)
 				return
 			}
 			targetConn, err := net.DialUDP("udp", nil, targetAddr)
 			if err != nil {
-				log.Printf("[metrics] datagram upstream error src=%s addr=%s: %v", remote, target, err)
+				log.Printf("[metrics] datagram upstream error src=%s: %v", remote, err)
 				sendWSClose(wsConn)
 				return
 			}
@@ -584,49 +709,36 @@ func makeHandler(authToken []byte) http.HandlerFunc {
 				return
 			}
 
-			// Flush initial datagram bytes that followed the stream header.
-			headerLen := computeHeaderLen(payload)
-			remaining := payload[headerLen:]
-			if len(remaining) >= 2 {
-				dgramLen := binary.BigEndian.Uint16(remaining[:2])
-				if int(dgramLen) <= len(remaining)-2 {
-					targetConn.Write(remaining[2 : 2+dgramLen]) //nolint:errcheck
-				}
-			}
+			// Flush initial datagrams that followed the stream header.
+			forwardDatagrams(targetConn, payload[headerLen:])
 
-			log.Printf("[metrics] datagram open src=%s upstream=%s", remote, target)
 			bridgeUDP(ww, wsReader, targetConn)
-			log.Printf("[metrics] datagram closed src=%s", remote)
 		}
 	}
 }
 
-// computeHeaderLen calculates the byte length of the routing header in a payload.
-func computeHeaderLen(payload []byte) int {
-	// version(1) + token(16) + ext_len(1) = offset 18
-	if len(payload) < 18 {
-		return len(payload)
-	}
-	extLen := int(payload[17])
-	offset := 18 + extLen // skip extension bytes
+var errClientClosed = fmt.Errorf("client closed before stream setup")
 
-	// operation(1) + port(2) + addrType(1) = 4 more bytes
-	offset += 4
-	if offset > len(payload) {
-		return len(payload)
-	}
-	addrType := payload[offset-1]
-	switch addrType {
-	case 1: // IPv4
-		offset += 4
-	case 2: // Domain
-		if offset < len(payload) {
-			offset += 1 + int(payload[offset])
+// readFirstDataFrame reads frames until a data frame (continuation, text, or
+// binary) arrives, replying to pings and ignoring pongs. Returns the data
+// frame's payload. errClientClosed signals a clean close before setup.
+func readFirstDataFrame(wsReader *bufio.Reader, conn net.Conn, ww *wsWriter) ([]byte, error) {
+	for {
+		payload, opcode, err := readWSFrame(wsReader)
+		if err != nil {
+			return nil, err
 		}
-	case 3: // IPv6
-		offset += 16
+		switch opcode {
+		case 0x0, 0x1, 0x2: // data frame carrying the stream header
+			return payload, nil
+		case 0x8: // clean close before stream setup
+			return nil, errClientClosed
+		case 0x9: // ping → pong, keep waiting
+			ww.pong(payload)
+			conn.SetReadDeadline(time.Now().Add(authTimeout)) //nolint:errcheck
+		}
+		// 0xA (unsolicited pong): ignore.
 	}
-	return offset
 }
 
 // ── TCP bridge ───────────────────────────────────────────────────────────────
@@ -690,9 +802,11 @@ func bridgeTCP(ww *wsWriter, wsReader *bufio.Reader, targetConn net.Conn) {
 
 // ── UDP bridge ───────────────────────────────────────────────────────────────
 //
-// Each WebSocket frame contains one UDP datagram (length-prefixed):
+// WebSocket frames carry length-prefixed UDP datagrams:
 //
-//	[2-byte big-endian length][datagram payload]
+//	[2-byte big-endian length][datagram payload] × N
+//
+// A single frame may pack several datagrams back-to-back; forward them all.
 func bridgeUDP(ww *wsWriter, wsReader *bufio.Reader, targetConn *net.UDPConn) {
 	done := make(chan struct{}, 2)
 	resetDeadline := func() {
@@ -702,7 +816,7 @@ func bridgeUDP(ww *wsWriter, wsReader *bufio.Reader, targetConn *net.UDPConn) {
 	}
 	resetDeadline()
 
-	// WS → Target: each frame is a length-prefixed UDP datagram
+	// WS → Target: unpack every datagram in each frame
 	go func() {
 		defer func() { done <- struct{}{} }()
 		for {
@@ -712,14 +826,7 @@ func bridgeUDP(ww *wsWriter, wsReader *bufio.Reader, targetConn *net.UDPConn) {
 			}
 			switch opcode {
 			case 0x0, 0x1, 0x2:
-				if len(payload) < 2 {
-					continue
-				}
-				dgramLen := binary.BigEndian.Uint16(payload[:2])
-				if int(dgramLen) > len(payload)-2 {
-					continue
-				}
-				targetConn.Write(payload[2 : 2+dgramLen]) //nolint:errcheck
+				forwardDatagrams(targetConn, payload)
 				resetDeadline()
 			case 0x8:
 				return
@@ -756,19 +863,32 @@ func bridgeUDP(ww *wsWriter, wsReader *bufio.Reader, targetConn *net.UDPConn) {
 	<-done
 }
 
+// forwardDatagrams parses and sends every length-prefixed datagram packed
+// into buf, stopping at a truncated tail (never a valid datagram).
+func forwardDatagrams(conn *net.UDPConn, buf []byte) {
+	for len(buf) >= 2 {
+		n := int(binary.BigEndian.Uint16(buf[:2]))
+		if n > len(buf)-2 {
+			break
+		}
+		conn.Write(buf[2 : 2+n]) //nolint:errcheck
+		buf = buf[2+n:]
+	}
+}
+
 // ── WebSocket framing (RFC 6455) ─────────────────────────────────────────────
 
 func upgradeWS(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.Reader, error) {
 	// RFC 6455 §4.2.1: version must be 13.
 	if r.Header.Get("Sec-Websocket-Version") != "13" {
 		w.Header().Set("Sec-WebSocket-Version", "13")
-		http.Error(w, "websocket version 13 required", http.StatusBadRequest)
+		nginxError(w, http.StatusBadRequest)
 		return nil, nil, fmt.Errorf("websocket version not 13")
 	}
 
 	key := r.Header.Get("Sec-Websocket-Key")
 	if key == "" {
-		http.Error(w, "missing Sec-WebSocket-Key", http.StatusBadRequest)
+		nginxError(w, http.StatusBadRequest)
 		return nil, nil, fmt.Errorf("missing Sec-WebSocket-Key header")
 	}
 
@@ -778,7 +898,7 @@ func upgradeWS(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.Reader,
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
-		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+		nginxError(w, http.StatusInternalServerError)
 		return nil, nil, fmt.Errorf("ResponseWriter does not implement http.Hijacker")
 	}
 
@@ -832,10 +952,31 @@ func readWSFrame(r io.Reader) ([]byte, byte, error) {
 	if hdr[0]&0x70 != 0 {
 		return nil, 0, fmt.Errorf("ws: reserved bits set (0x%02x)", hdr[0])
 	}
+	fin := hdr[0]&0x80 != 0
 	opcode := hdr[0] & 0x0f
-	hasMask := hdr[1]>>7 == 1
-	payloadLen := uint64(hdr[1] & 0x7f)
 
+	// Only data and the three control opcodes are defined; anything else is a
+	// protocol error (RFC 6455 §5.2), and control frames must not be
+	// fragmented (§5.4).
+	switch opcode {
+	case 0x0, 0x1, 0x2:
+	case 0x8, 0x9, 0xa:
+		if !fin {
+			return nil, 0, fmt.Errorf("ws: fragmented control frame (opcode 0x%x)", opcode)
+		}
+	default:
+		return nil, 0, fmt.Errorf("ws: unknown opcode 0x%x", opcode)
+	}
+
+	// RFC 6455 §5.1: the server must close the connection on receiving an
+	// unmasked frame from a client. Tolerating it is both a spec violation
+	// and a differentiator strict probers can poke at.
+	hasMask := hdr[1]>>7 == 1
+	if !hasMask {
+		return nil, 0, fmt.Errorf("ws: unmasked client frame")
+	}
+
+	payloadLen := uint64(hdr[1] & 0x7f)
 	switch payloadLen {
 	case 126:
 		var ext uint16
@@ -849,15 +990,24 @@ func readWSFrame(r io.Reader) ([]byte, byte, error) {
 		}
 	}
 
+	// RFC 6455 §5.5: control frames carry at most 125 bytes; a close frame
+	// with a lone byte of payload is invalid (no complete status code).
+	if opcode >= 0x8 {
+		if payloadLen > 125 {
+			return nil, 0, fmt.Errorf("ws: control frame payload too large: %d", payloadLen)
+		}
+		if opcode == 0x8 && payloadLen == 1 {
+			return nil, 0, fmt.Errorf("ws: close frame with 1-byte payload")
+		}
+	}
+
 	if payloadLen > maxWSPayload {
 		return nil, 0, fmt.Errorf("ws frame payload too large: %d bytes (max %d)", payloadLen, maxWSPayload)
 	}
 
 	var mask [4]byte
-	if hasMask {
-		if _, err := io.ReadFull(r, mask[:]); err != nil {
-			return nil, 0, err
-		}
+	if _, err := io.ReadFull(r, mask[:]); err != nil {
+		return nil, 0, err
 	}
 
 	payload := make([]byte, payloadLen)
@@ -865,10 +1015,8 @@ func readWSFrame(r io.Reader) ([]byte, byte, error) {
 		return nil, 0, err
 	}
 
-	if hasMask {
-		for i := range payload {
-			payload[i] ^= mask[i%4]
-		}
+	for i := range payload {
+		payload[i] ^= mask[i%4]
 	}
 	return payload, opcode, nil
 }
@@ -950,53 +1098,65 @@ func parseUUID(s string) ([]byte, error) {
 	return b, nil
 }
 
-// isBlockedAddr checks whether a resolved address is in a blocked range
-// (loopback, link-local, private RFC1918, cloud metadata, unspecified).
-func isBlockedAddr(addr string) bool {
-	host := addr
-	if h, _, err := net.SplitHostPort(addr); err == nil {
-		host = h
+// blockedPorts are destination ports the gateway refuses to proxy to.
+// Port 25 is the classic abuse vector: letting a PaaS workload originate
+// SMTP traffic is the fastest route to a provider ban.
+var blockedPorts = map[string]struct{}{"25": {}}
+
+// blockedPrefixes are address ranges not covered by netip.Addr.IsPrivate but
+// still unsuitable as external stream targets.
+var blockedPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"), // CGNAT / carrier internal (RFC 6598)
+	netip.MustParsePrefix("198.18.0.0/15"), // benchmarking (RFC 2544)
+	netip.MustParsePrefix("192.0.0.0/24"),  // IETF protocol assignments (RFC 6890)
+}
+
+// isBlockedIP reports whether an IP is loopback, link-local (which covers the
+// cloud metadata address 169.254.169.254), private, unspecified, multicast,
+// or in one of blockedPrefixes. IPv4-mapped IPv6 addresses are normalised
+// first so ::ffff:127.0.0.1 cannot smuggle a blocked v4 address past the check.
+func isBlockedIP(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsPrivate() || ip.IsUnspecified() || ip.IsMulticast() {
+		return true
 	}
-	ip, err := netip.ParseAddr(host)
-	if err != nil {
-		return false // not an IP, let the dialer handle DNS errors
+	for _, p := range blockedPrefixes {
+		if p.Contains(ip) {
+			return true
+		}
 	}
-	return ip.IsLoopback() ||
-		ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() ||
-		ip.IsPrivate() ||
-		ip.IsUnspecified() ||
-		ip.IsMulticast() ||
-		// Cloud metadata endpoint: 169.254.169.254
-		ip == netip.MustParseAddr("169.254.169.254")
+	return false
 }
 
 // resolveAndCheckTarget resolves a host:port, checks for blocked IPs, and returns
 // the resolved address suitable for dialing. Returns error if the target is blocked.
 func resolveAndCheckTarget(host, port string) (string, error) {
+	if _, blocked := blockedPorts[port]; blocked {
+		return "", fmt.Errorf("destination port %s blocked", port)
+	}
+
 	// If host is already an IP, check directly
 	if ip, err := netip.ParseAddr(host); err == nil {
-		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-			ip.IsPrivate() || ip.IsUnspecified() || ip.IsMulticast() ||
-			ip == netip.MustParseAddr("169.254.169.254") {
+		if isBlockedIP(ip) {
 			return "", fmt.Errorf("blocked target address")
 		}
 		return net.JoinHostPort(host, port), nil
 	}
 
-	// Resolve domain and check all resolved IPs
+	// Resolve domain and check all resolved IPs. The checked address itself is
+	// what's dialed (not a re-resolved one), so no DNS-rebind TOCTOU gap.
 	ips, err := net.LookupIP(host)
 	if err != nil {
 		return "", fmt.Errorf("dns lookup: %w", err)
 	}
-	for _, ip := range ips {
-		if isBlockedAddr(ip.String()) {
-			return "", fmt.Errorf("blocked target address")
-		}
-	}
-	// Use the first resolved IP
 	if len(ips) == 0 {
 		return "", fmt.Errorf("no addresses found for %s", host)
+	}
+	for _, ip := range ips {
+		if addr, ok := netip.AddrFromSlice(ip); ok && isBlockedIP(addr) {
+			return "", fmt.Errorf("blocked target address")
+		}
 	}
 	return net.JoinHostPort(ips[0].String(), port), nil
 }

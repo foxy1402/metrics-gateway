@@ -1,0 +1,4 @@
+# Shell scripts and Go sources are consumed inside Linux containers; keep them
+# LF-terminated even when checked out on Windows (a CRLF shebang breaks the
+# container's exec of service-start.sh).
+* text=auto eol=lf

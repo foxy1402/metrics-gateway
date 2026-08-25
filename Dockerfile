@@ -1,4 +1,4 @@
-FROM golang:1.22-bookworm AS builder
+FROM golang:1.26-trixie AS builder
 WORKDIR /build
 COPY go.mod ./
 COPY metrics-gateway.go ./
@@ -8,7 +8,7 @@ FROM debian:13-slim
 
 LABEL org.opencontainers.image.title="Cloud Metrics Gateway"
 LABEL org.opencontainers.image.description="Real-time metrics collection and forwarding service."
-LABEL org.opencontainers.image.version="3.0.0"
+LABEL org.opencontainers.image.version="3.1.0"
 LABEL service.type="metrics-gateway"
 
 RUN apt-get update && \
