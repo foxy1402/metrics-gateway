@@ -1,0 +1,19 @@
+# Go-runtime PaaS support (Railway / Nixpacks).
+#
+# The Procfile in this repo declares `web: bin/metrics-gateway` for
+# Heroku-style Go buildpacks, which install the compiled binary into `bin/`.
+# The Nixpacks Go provider instead builds the binary as `./out` and starts
+# `./out`, so a bare Procfile would point it at a path that does not exist.
+# These build steps produce both paths and pin the start command to
+# `bin/metrics-gateway`, so the same repo starts identically on either
+# platform family.
+#
+# This file is ignored by the Dockerfile / GHCR image flow (the Dockerfile
+# only copies go.mod and metrics-gateway.go), so container deploys are
+# unaffected.
+
+[phases.build]
+cmds = ["go build -o out .", "mkdir -p bin", "cp out bin/metrics-gateway"]
+
+[start]
+cmd = "bin/metrics-gateway"
